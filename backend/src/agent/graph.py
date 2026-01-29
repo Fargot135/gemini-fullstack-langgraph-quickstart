@@ -1,50 +1,104 @@
 import os
-
-from agent.tools_and_schemas import SearchQueryList, Reflection
+from pathlib import Path
 from dotenv import load_dotenv
+from langchain_groq import ChatGroq
 from langchain_core.messages import AIMessage
+from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
-from langchain_groq import ChatGroq  # Додано для Groq
 
 from agent.state import (
     OverallState,
     QueryGenerationState,
-    ReflectionState,
     WebSearchState,
 )
 from agent.configuration import Configuration
+from agent.tools_and_schemas import SearchQueryList
 from agent.prompts import (
     get_current_date,
     query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
     answer_instructions,
 )
-from agent.utils import (
-    get_citations,
-    get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
-)
+from agent.utils import get_research_topic
 
 load_dotenv()
 
 if os.getenv("GROQ_API_KEY") is None:
     raise ValueError("GROQ_API_KEY is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+def get_llm(temperature=0.1):
+    """Initialize Groq Llama 3.3 70B with configurable temperature.
+    
+    Args:
+        temperature: Sampling temperature for the model (default: 0.1)
+        
+    Returns:
+        ChatGroq: Configured Groq LLM instance
+    """
+    return ChatGroq(
+        model="llama-3.3-70b-versatile",
+        temperature=temperature,
+        api_key=os.getenv("GROQ_API_KEY")
+    )
 
 
-# Nodes
+def search_local_files(directory: str, query: str):
+    """Search for markdown files containing query keywords with relevance scoring.
+    
+    Args:
+        directory: Root directory to search
+        query: Search query string
+        
+    Returns:
+        List of tuples (file_path, content) sorted by relevance
+    """
+    results = []
+    query_lower = query.lower()
+    query_keywords = [kw.lower() for kw in query.split() if len(kw) > 1]
+    
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.md'):
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        content_lower = content.lower()
+                        file_lower = file.lower()
+                        path_lower = file_path.lower()
+                        
+                        score = 0
+                        
+                        # High score for filename matches
+                        for keyword in query_keywords:
+                            if keyword in file_lower:
+                                score += 50
+                            if keyword in path_lower:
+                                score += 30
+                        
+                        # Medium score for content matches
+                        for keyword in query_keywords:
+                            score += content_lower.count(keyword) * 5
+                        
+                        # Bonus for exact phrase match
+                        if query_lower in content_lower:
+                            score += 100
+                        
+                        if score > 0:
+                            relative_path = os.path.relpath(file_path, directory)
+                            results.append((relative_path, content, score))
+                except Exception:
+                    continue
+    
+    results.sort(key=lambda x: x[2], reverse=True)
+    return [(path, content) for path, content, _ in results]
+
+
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
-    Uses Llama-3.3-70b-versatile via Groq to create optimized search queries for web research based on
+    Uses Groq Llama 3.3 70B to create optimized search queries for research based on
     the User's question.
 
     Args:
@@ -56,34 +110,37 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     """
     configurable = Configuration.from_runnable_config(config)
 
-    # check for custom initial search query count
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Llama 3.3 via Groq
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=1.0,
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-    )
+    llm = get_llm(temperature=1.0)
     structured_llm = llm.with_structured_output(SearchQueryList)
 
-    # Format the prompt
     current_date = get_current_date()
     formatted_prompt = query_writer_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
-    # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
+    
+    try:
+        result = structured_llm.invoke(formatted_prompt)
+        return {"search_query": result.query}
+    except Exception:
+        # Fallback: use the original question as the search query
+        return {"search_query": [get_research_topic(state["messages"])]}
 
 
 def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
+    """LangGraph node that sends the search queries to the research node.
 
-    This is used to spawn n number of web research nodes, one for each search query.
+    This is used to spawn n number of research nodes, one for each search query.
+    
+    Args:
+        state: Current graph state containing the generated search queries
+        
+    Returns:
+        List of Send objects, one for each search query to process in parallel
     """
     return [
         Send("web_research", {"search_query": search_query, "id": int(idx)})
@@ -92,127 +149,64 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """LangGraph node that performs local file research.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Searches local markdown files for relevant content based on the search query,
+    then processes the results with Groq Llama 3.3 70B for analysis.
 
     Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
+        state: Current graph state containing the search query
+        config: Configuration for the runnable, including local_dir setting
 
     Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
+        Dictionary with state update, including sources_gathered and web_research_results
     """
-    # Configure
-    configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
+    local_dir = config.get("configurable", {}).get("local_dir")
+    
+    if not local_dir:
+        raise ValueError("local_dir must be specified in config")
+    
+    search_results = search_local_files(local_dir, state["search_query"])
+    
+    if not search_results:
+        return {
+            "sources_gathered": [],
+            "search_query": [state["search_query"]],
+            "web_research_result": [f"No relevant files found for query: {state['search_query']}"],
+        }
+    
+    search_context = "\n\n---FILE---\n\n".join([
+        f"File: {path}\n\n{content[:3000]}" 
+        for path, content in search_results[:3]
+    ])
+    
+    llm = get_llm(temperature=0)
+    
+    groq_prompt = f"""Analyze documentation to answer: {state["search_query"]}
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    # Keep gemini-2.0-flash here as it's required for the native google_search tool
-    response = genai_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+Documentation files:
 
+{search_context}
+
+Provide a concise answer with specific code examples and syntax details.
+IMPORTANT: Do not generate any web URLs or links. Only reference the file names provided."""
+    
+    try:
+        groq_response = llm.invoke(groq_prompt)
+        content = groq_response.content
+    except Exception as e:
+        content = f"Error analyzing files: {str(e)}"
+    
+    sources_gathered = [
+        {"value": path, "short_url": path} 
+        for path, _ in search_results[:3]
+    ]
+    
     return {
         "sources_gathered": sources_gathered,
         "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "web_research_result": [content],
     }
-
-
-def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
-    """LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
-
-    Analyzes the current summary to identify areas for further research and generates
-    potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
-
-    Args:
-        state: Current graph state containing the running summary and research topic
-        config: Configuration for the runnable, including LLM provider settings
-
-    Returns:
-        Dictionary with state update, including search_query key containing the generated follow-up query
-    """
-    configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
-    state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
-    )
-    # init Llama 3.3 Reasoning Model via Groq
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=1.0,
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
-
-    return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
-    }
-
-
-def evaluate_research(
-    state: ReflectionState,
-    config: RunnableConfig,
-) -> OverallState:
-    """LangGraph routing function that determines the next step in the research flow.
-
-    Controls the research loop by deciding whether to continue gathering information
-    or to finalize the summary based on the configured maximum number of research loops.
-
-    Args:
-        state: Current graph state containing the research loop count
-        config: Configuration for the runnable, including max_research_loops setting
-
-    Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
-    """
-    configurable = Configuration.from_runnable_config(config)
-    max_research_loops = (
-        state.get("max_research_loops")
-        if state.get("max_research_loops") is not None
-        else configurable.max_research_loops
-    )
-    if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
-        return "finalize_answer"
-    else:
-        return [
-            Send(
-                "web_research",
-                {
-                    "search_query": follow_up_query,
-                    "id": state["number_of_ran_queries"] + int(idx),
-                },
-            )
-            for idx, follow_up_query in enumerate(state["follow_up_queries"])
-        ]
 
 
 def finalize_answer(state: OverallState, config: RunnableConfig):
@@ -220,68 +214,55 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
 
     Prepares the final output by deduplicating and formatting sources, then
     combining them with the running summary to create a well-structured
-    research report with proper citations.
+    research report with proper citations using Groq Llama 3.3 70B.
 
     Args:
         state: Current graph state containing the running summary and sources gathered
+        config: Configuration for the runnable
 
     Returns:
         Dictionary with state update, including running_summary key containing the formatted final summary with sources
     """
-    # Format the prompt
+    configurable = Configuration.from_runnable_config(config)
+
     current_date = get_current_date()
     formatted_prompt = answer_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
+    formatted_prompt += "\n\nIMPORTANT: Do not generate any web URLs or external links in your response."
 
-    # init Llama 3.3 via Groq
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=0,
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-    )
+    llm = get_llm(temperature=0)
     result = llm.invoke(formatted_prompt)
 
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
+    seen = set()
     for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
+        if source["value"] not in seen:
+            seen.add(source["value"])
             unique_sources.append(source)
 
+    sources_text = "\n\nSources:\n" + "\n".join([f"- {s['value']}" for s in unique_sources])
+    final_content = result.content + sources_text
+
     return {
-        "messages": [AIMessage(content=result.content)],
+        "messages": [AIMessage(content=final_content)],
         "sources_gathered": unique_sources,
     }
 
 
-# Create our Agent Graph
 builder = StateGraph(OverallState, config_schema=Configuration)
 
-# Define the nodes we will cycle between
 builder.add_node("generate_query", generate_query)
 builder.add_node("web_research", web_research)
-builder.add_node("reflection", reflection)
 builder.add_node("finalize_answer", finalize_answer)
 
-# Set the entrypoint as `generate_query`
-# This means that this node is the first one called
 builder.add_edge(START, "generate_query")
-# Add conditional edge to continue with search queries in a parallel branch
 builder.add_conditional_edges(
     "generate_query", continue_to_web_research, ["web_research"]
 )
-# Reflect on the web research
-builder.add_edge("web_research", "reflection")
-# Evaluate the research
-builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
-)
-# Finalize the answer
+builder.add_edge("web_research", "finalize_answer")
 builder.add_edge("finalize_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+graph = builder.compile(name="local-search-agent")
